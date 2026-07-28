@@ -1,0 +1,163 @@
+name: verify-silent-install
+
+# Microsoft Store の EXE アプリ審査は、登録した silent パラメータ (/S) で
+# インストーラが無人インストールできることを要求する (10.3.4 App Is Testable)。
+# Partner Center の Package validation は1回30分かかるうえ、落ちても
+# 「確認できませんでした」としか出ないため、同じことをここで数分で回す。
+#
+# ⚠️ URL ごとに必ず別ランナーで実行すること。
+#    同じマシンで2本続けて入れると、2本目は HKCU に前回の InstallLocation が
+#    残っているため NSIS が別経路を通り、初回インストール特有の不具合を見逃す。
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls_json:
+        description: '検証するインストーラURLのJSON配列'
+        required: true
+        default: >-
+          ["https://pub-8040aad50074484ba1ef46e4a2d75095.r2.dev/v0.4.0/AccountLane-0.4.0-x64-setup.exe",
+           "https://pub-8040aad50074484ba1ef46e4a2d75095.r2.dev/v1.1.2/AccountLane-1.1.2-x64-setup.exe"]
+      app_name:
+        description: 'add/remove programs で探すアプリ名'
+        required: false
+        default: 'AccountLane'
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        url: ${{ fromJSON(inputs.urls_json) }}
+    steps:
+      - name: 環境情報
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          "OS          : $($os.Caption) $($os.Version)"
+          "Arch        : $env:PROCESSOR_ARCHITECTURE"
+          "User        : $env:USERNAME"
+          $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $isAdmin = ([Security.Principal.WindowsPrincipal]$id).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+          "Elevated    : $isAdmin"
+          "LOCALAPPDATA: $env:LOCALAPPDATA"
+
+      - name: インストーラを取得
+        shell: pwsh
+        run: |
+          $url = '${{ matrix.url }}'
+          "URL: $url"
+          Invoke-WebRequest -Uri $url -OutFile setup.exe -UseBasicParsing
+          $f = Get-Item setup.exe
+          "Size: $($f.Length) bytes"
+          "SHA256: $((Get-FileHash setup.exe -Algorithm SHA256).Hash)"
+
+      - name: Authenticode 署名を確認
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature .\setup.exe
+          "Status : $($sig.Status)"
+          "Signer : $($sig.SignerCertificate.Subject)"
+          "Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "署名が不正: $($sig.Status)" }
+
+      - name: インストール前の状態を確認
+        shell: pwsh
+        run: |
+          $name = '${{ inputs.app_name }}'
+          $keys = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $pre = Get-ItemProperty $keys -EA SilentlyContinue |
+                 Where-Object { $_.DisplayName -like "*$name*" }
+          if ($pre) { throw "クリーンな状態ではない。既にインストール済み: $($pre.DisplayName)" }
+          '未インストールを確認。'
+          # WER のクラッシュイベントを後で拾うための基準時刻
+          (Get-Date).ToString('o') | Out-File -FilePath started_at.txt -Encoding utf8
+
+      - name: サイレントインストール (/S)
+        id: install
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath (Resolve-Path .\setup.exe) -ArgumentList '/S' -PassThru
+          if (-not $p.WaitForExit(600000)) {
+            $p.Kill()
+            throw 'インストーラが10分で終了しなかった（ハング）'
+          }
+          $code = $p.ExitCode
+          $hex  = '0x{0:X8}' -f $code
+          "exit code: $code ($hex)"
+          "code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($code -ne 0) {
+            switch ($code) {
+              -1073741819 { '  → 0xC0000005 STATUS_ACCESS_VIOLATION（インストーラがクラッシュ）' }
+              3221225477  { '  → 0xC0000005 STATUS_ACCESS_VIOLATION（インストーラがクラッシュ）' }
+              default     { '  → 非ゼロ終了' }
+            }
+          }
+
+      - name: Application Error イベント（クラッシュ時の詳細）
+        if: always()
+        shell: pwsh
+        run: |
+          $start = [datetime]::Parse((Get-Content started_at.txt -Raw).Trim())
+          $ev = Get-WinEvent -FilterHashtable @{
+                  LogName      = 'Application'
+                  ProviderName = 'Application Error'
+                  StartTime    = $start
+                } -EA SilentlyContinue
+          if (-not $ev) { 'Application Error イベントなし（クラッシュしていない）'; return }
+          foreach ($e in $ev) {
+            "--- $($e.TimeCreated) ---"
+            $e.Message
+          }
+
+      - name: add/remove programs のエントリ
+        if: always()
+        shell: pwsh
+        run: |
+          $name = '${{ inputs.app_name }}'
+          $keys = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $found = Get-ItemProperty $keys -EA SilentlyContinue |
+                   Where-Object { $_.DisplayName -like "*$name*" }
+          if (-not $found) {
+            'エントリなし（Store の「Entry in add or remove programs」チェックに落ちる）'
+            exit 1
+          }
+          foreach ($e in $found) {
+            "Hive           : $($e.PSPath -replace '.*::','' -replace '\\Software.*','')"
+            "DisplayName    : $($e.DisplayName)"
+            "Publisher      : $($e.Publisher)"
+            "DisplayVersion : $($e.DisplayVersion)"
+            "InstallLocation: $($e.InstallLocation)"
+            "UninstallString: $($e.UninstallString)"
+            ''
+          }
+
+      - name: 展開されたファイル
+        if: always()
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\${{ inputs.app_name }}'
+          if (-not (Test-Path $dir)) { "インストール先が存在しない: $dir"; exit 1 }
+          $items = Get-ChildItem $dir -Recurse -File
+          "ファイル数: $($items.Count)"
+          "合計サイズ: $([math]::Round(($items | Measure-Object Length -Sum).Sum / 1MB, 1)) MB"
+          Get-ChildItem $dir | Select-Object Mode, Length, Name | Format-Table -AutoSize | Out-String
+
+      - name: 判定
+        if: always()
+        shell: pwsh
+        run: |
+          $code = '${{ steps.install.outputs.code }}'
+          $line = if ($code -eq '0') { '✅ PASS' } else { "❌ FAIL (exit $code)" }
+          "$line  ${{ matrix.url }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($code -ne '0') { exit 1 }
