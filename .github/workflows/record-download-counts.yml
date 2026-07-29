@@ -1,0 +1,105 @@
+name: record-download-counts
+
+# AccountLane の利用規模を、アプリに計測コードを入れずに把握するための記録。
+#
+# electron-updater は更新チェックのたびに最新リリースの latest.yml / latest-mac.yml を
+# 取りに来る。この2ファイルは人が手で落とすものではないので、ダウンロード数の増分が
+# 「更新チェックした端末の延べ数」の近似になる。
+#
+# ⚠️ 保存するのは必ず「累積値の生データ」。差分だけを保存すると、実行が1回飛んだときに
+#    その日の増分が永久に失われる。差分は読むときに計算する。
+
+on:
+  schedule:
+    - cron: '0 15 * * *' # 00:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ダウンロード数を追記
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh api "/repos/${{ github.repository }}/releases?per_page=100" > /tmp/releases.json
+          python3 - <<'PY'
+          import csv, json, os, datetime, pathlib
+
+          CSV = pathlib.Path('metrics/download-counts.csv')
+          COLUMNS = ['recorded_at', 'tag', 'asset', 'download_count']
+          TARGETS = ('latest.yml', 'latest-mac.yml')
+
+          releases = json.load(open('/tmp/releases.json'))
+          now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+          rows = []
+          for r in releases:
+              if r['draft']:
+                  continue
+              for a in r['assets']:
+                  if a['name'] in TARGETS:
+                      rows.append({
+                          'recorded_at': now,
+                          'tag': r['tag_name'],
+                          'asset': a['name'],
+                          'download_count': a['download_count'],
+                      })
+          rows.sort(key=lambda x: (x['tag'], x['asset']))
+
+          # 直前の記録を読んで増分を出す（表示のみ。保存するのは累積値）
+          previous = {}
+          existing = []
+          if CSV.exists():
+              existing = list(csv.DictReader(CSV.open()))
+              for row in existing:
+                  previous[(row['tag'], row['asset'])] = int(row['download_count'])
+
+          CSV.parent.mkdir(parents=True, exist_ok=True)
+          write_header = not CSV.exists()
+          with CSV.open('a', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=COLUMNS)
+              if write_header:
+                  w.writeheader()
+              w.writerows(rows)
+
+          lines = ['| リリース | ファイル | 累積 | 前回からの増分 |', '|---|---|---:|---:|']
+          total = 0
+          for row in rows:
+              key = (row['tag'], row['asset'])
+              count = row['download_count']
+              if key in previous:
+                  delta = count - previous[key]
+                  total += delta
+                  shown = f'+{delta}' if delta else '0'
+              else:
+                  shown = '(初回)'
+              lines.append(f"| {row['tag']} | {row['asset']} | {count} | {shown} |")
+          lines.append('')
+          lines.append(f'**全リリース合計の増分: {total}**' if existing else '**初回記録。次回から増分が出ます。**')
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          text = '\n'.join(lines)
+          print(text)
+          if summary:
+              open(summary, 'a').write(text + '\n')
+          PY
+
+      - name: コミット
+        shell: bash
+        run: |
+          if git diff --quiet -- metrics/; then
+            echo '変化なし。コミットしない。'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add metrics/
+          git commit -m "chore: record download counts ($(date -u +%Y-%m-%d))"
+          git push
